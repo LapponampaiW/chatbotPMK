@@ -132,23 +132,56 @@ function extractKeywords(raw) {
     .filter(k => k.length >= 4);
 }
 
-function readSheetObjects_() {
+/******************************************************************/
+/***** CACHE UTILITIES *****/
+// เก็บข้อมูลทั้งชีตเป็นอาร์เรย์ของอ็อบเจ็กต์ใน Cache 1 ชั่วโมง (3600 วินาที)
+const CACHE_KEY_SHEET_OBJECTS = 'SHEET_OBJECTS_CACHE_V1';
+
+function readSheetObjectsCached_() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get(CACHE_KEY_SHEET_OBJECTS);
+  if (cached) {
+    try {
+      return JSON.parse(cached);
+    } catch (e) {
+      // ถ้าแคชเสียรูปแบบ จะอ่านใหม่ด้านล่าง
+    }
+  }
+
+  // อ่านใหม่จากชีต
   const sh = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
   const values = sh.getDataRange().getValues();
-  if (values.length <= 1) return [];
+  if (values.length <= 1) {
+    cache.put(CACHE_KEY_SHEET_OBJECTS, JSON.stringify([]), 3600);
+    return [];
+  }
+
   const headers = values[0].map(h => h.toString().trim());
   const rows = values.slice(1);
-
-  return rows.map(r => {
+  const data = rows.map(r => {
     const obj = {};
     headers.forEach((h, i) => obj[h] = r[i]);
     return obj;
   });
+
+  cache.put(CACHE_KEY_SHEET_OBJECTS, JSON.stringify(data), 3600);
+  return data;
 }
 
-/***** SEARCH CORE (เดิม) *****/
+// ใช้เมื่อมีการแก้ไขชีตหรืออยากบังคับรีเฟรช
+function clearSheetObjectsCache_() {
+  CacheService.getScriptCache().remove(CACHE_KEY_SHEET_OBJECTS);
+}
+
+// (ตัวเลือก) ลบแคชอัตโนมัติเมื่อมีการแก้ไขสเปรดชีต
+function onEdit(e) {
+  clearSheetObjectsCache_();
+}
+
+/******************************************************************/
+/***** SEARCH CORE (เดิม แต่เปลี่ยนไปใช้แคช) *****/
 function searchByKeywords(keywords, matchMode) {
-  const data = readSheetObjects_();
+  const data = readSheetObjectsCached_();
   const results = [];
   const wantAll = (matchMode || 'ANY').toUpperCase() === 'ALL';
 
@@ -189,20 +222,21 @@ function searchByKeywords(keywords, matchMode) {
   }));
 }
 
-/***** FIND PENDING CORE (ใช้วันที่เป็นสตริง) *****/
+/******************************************************************/
+/***** FIND PENDING CORE (ใช้วันที่เป็นสตริง + แคช) *****/
 function buildPendingSummary_() {
-  const data = readSheetObjects_();
+  const data = readSheetObjectsCached_();
 
   // กรองสถานะที่มีคำว่า 'pending' (ไม่สนตัวพิมพ์เล็ก/ใหญ่)
   const pendingRows = data
     .filter(r => normalizeText(r[COL_STATUS]).includes('pending'))
     .map(r => {
-      const rawDateStr = (r[COL_DATE] ?? '').toString().trim();   // ← ชื่อใหม่ไม่ชน
+      const rawDateStr = (r[COL_DATE] ?? '').toString().trim();
       const formatted  = rawDateStr ? formatCustomDate(rawDateStr) : '';
       return {
         docNo:  r[COL_DOC_NO]  || '',
         title:  r[COL_TITLE]   || '',
-        dateText: formatted ? `(${formatted})` : ''               // ใช้ค่าที่ฟอร์แมตแล้ว
+        dateText: formatted ? `(${formatted})` : ''
       };
     });
 
@@ -228,7 +262,7 @@ function formatCustomDate(tdate) {
   if (!tdate) return '';
   var d = (tdate instanceof Date) ? tdate : new Date(tdate);
   if (isNaN(d)) return '';                 // กันกรณีพาร์สไม่ได้
-  return Utilities.formatDate(d, "Asia\/Bangkok", "dd-MMM-yy HH:mm");
+  return Utilities.formatDate(d, "Asia/Bangkok", "dd-MMM-yy HH:mm");
 }
 
 // ►►► NEW: เขียนข้อมูลลงชีต RIS ตามหัวคอลัมน์ (UserID, Bol_YN)
@@ -358,61 +392,8 @@ function dialogflowLineQuickReplyCustom_(text, pairs) {
   };
 }
 
-
-
-
 /***** DIALOGFLOW WEBHOOK *****/
 function doPost(e) {
-  //ส่วนบนเฉพาะ log เท่านั้นเปิดแล้วปิดได้
-  //ให้ทาง user ยิงมาก่อนเพื่อเก็บ userID แล้วค่อยปิด ส่วนที่เป็น try cache อันแรก
-  /** 
-  try {
-    // raw JSON ที่ Dialogflow ส่งมา
-    const rawBody = e.postData?.contents || '';
-    const body = rawBody ? JSON.parse(rawBody) : {};
-
-    // header ทั้งหมด (บางทีจะมีข้อมูลของ proxy/source)
-    const headers = e?.headers || {};
-
-    // ตรวจ platform และ parse
-    const which = detectPlatform(body);
-    let summary;
-    if (which === 'ES') {
-      summary = parseDialogflowES(body);
-    } else if (which === 'CX') {
-      summary = parseDialogflowCX(body);
-    } else {
-      summary = {
-        platform: 'UNKNOWN',
-        session: '',
-        intentName: '',
-        queryText: '',
-        parameters: {},
-        lineUserId: ''
-      };
-    }
-
-    // เขียนแบบหลายคอลัมน์ให้อ่านง่าย + เก็บ Raw ไว้สำหรับ debug
-    writeStructuredLog({
-      platform: summary.platform,
-      session: summary.session,
-      intentName: summary.intentName,
-      queryText: summary.queryText,
-      parameters: summary.parameters,
-      lineUserId: summary.lineUserId,
-      headers,
-      raw: body
-    });
-
-    // เขียน log แบบสั้น ๆ เพิ่ม (เผื่ออยากเห็นในคอลัมน์เดียว)
-    logActivity(`[${summary.platform}] intent="${summary.intentName}" query="${summary.queryText}" session="${summary.session}"`);
-
-  } catch (err) {
-    // หากพัง ให้ log และส่ง 200 กลับด้วยข้อความ error (กัน Dialogflow timeout/retry)
-    logActivity(`ERROR: ${err && err.message}`);
-  }
-  */
-
   try {
     const body = JSON.parse(e.postData.contents);
 
@@ -424,54 +405,7 @@ function doPost(e) {
       displayName = body.intentInfo.displayName || '';
     }
 
-    /** 
-    // 1) intent = SearchByKeyboard → logic เดิม
-    if (displayName === 'SearchByKeyboard') {
-      const params = (body.queryResult && body.queryResult.parameters) || {};
-      let rawInput =
-        (params.keyword || params.keywords || '').toString() ||
-        (body.queryResult && body.queryResult.queryText) ||
-        (body.text && body.text) || '';
-
-      const matchMode =
-        (params.matchMode || params.matchmode || 'ANY').toString();
-
-      const keywords = extractKeywords(rawInput);
-
-      if (keywords.length === 0) {
-        return ContentService.createTextOutput(JSON.stringify(dialogflowTextResponse_(
-          'กรุณาพิมพ์คำค้นอย่างน้อยหนึ่งคำ และแต่ละคำต้องยาวตั้งแต่ 4 ตัวอักษรขึ้นไป'
-        ))).setMimeType(ContentService.MimeType.JSON);
-      }
-
-      const found = searchByKeywords(keywords, matchMode);
-
-      if (found.length === 0) {
-        return ContentService.createTextOutput(JSON.stringify(dialogflowTextResponse_(
-          `ไม่พบเลขที่รับเข้าที่มีคำว่า: ${keywords.join(', ')}`
-        ))).setMimeType(ContentService.MimeType.JSON);
-      }
-
-      const lines = [];
-      lines.push(`พบในเลขที่รับเข้า ${found.length} รายการ:`);
-      found.slice(0, 50).forEach(r => {
-        const mk = r.matchedKeywords.length ? ` (matched: ${r.matchedKeywords.join(', ')})` : '';
-        const titlePart = r.title ? `: ${r.title}` : '';
-        lines.push(`• ${r.docNo}${titlePart} ${mk}`);
-      });
-      if (found.length > 50) {
-        lines.push(`…และอีก ${found.length - 50} รายการ`);
-      }
-
-      // NEW: ทำ Quick Reply ปุ่มตามเลขที่รับเข้า (เอาได้สูงสุด 13 ปุ่ม)
-      const quickDocNos = found.map(r => r.docNo).filter(Boolean);
-      const responsePayload = dialogflowLineQuickReplyResponse_(lines.join('\n'), quickDocNos);
-      return ContentService.createTextOutput(JSON.stringify(responsePayload))
-        .setMimeType(ContentService.MimeType.JSON);
-    }
-    */
-
- // 1) intent = SearchByKeyboard → logic เดิม + กรณีพิเศษเลข 4 หลัก
+    // 1) intent = SearchByKeyboard → logic เดิม + กรณีพิเศษเลข 4 หลัก
     if (displayName === 'SearchByKeyboard') {
       const params = (body.queryResult && body.queryResult.parameters) || {};
       let rawInput =
@@ -484,7 +418,7 @@ function doPost(e) {
 
       // >>> กรณีพิเศษ: ถ้าเป็น "ตัวเลข 4 หลักล้วนๆ" ให้ค้นเท่ากับเลขที่รับเข้า
       if (isFourDigitsOnly) {
-        const data = readSheetObjects_();
+        const data = readSheetObjectsCached_();  // ใช้แคช
 
         // เทียบแบบตรงตัว (trim แล้วเท่ากันเป๊ะ 4 หลัก)
         const matchedRows = data.filter(r => String(r[COL_DOC_NO]).trim() === input);
@@ -515,7 +449,7 @@ function doPost(e) {
           lines.join('\n'),
           [
             { label: 'use AI search', text: `AI ${input}` },
-            { label: 'cancel',        text: 'cancel' }
+            { label: 'cancel',        text: '' }
           ]
         );
 
@@ -570,19 +504,11 @@ function doPost(e) {
     }
 
     // 3) intent = FindPending → สรุปรายการ Pending (วันที่เป็นสตริง)
-    /** 
-    if (displayName === 'FindPending') {
-      const text = buildPendingSummary_();
-      return ContentService.createTextOutput(JSON.stringify(dialogflowTextResponse_(text)))
-        .setMimeType(ContentService.MimeType.JSON);
-    }*/
-
-    // 3) intent = FindPending → สรุปรายการ Pending (วันที่เป็นสตริง)
     if (displayName === 'FindPending') {
       const text = buildPendingSummary_();
 
       // รวบรวม docNo สำหรับ Quick Reply (อิงเงื่อนไข pending เดียวกับ buildPendingSummary_)
-      const data = readSheetObjects_();
+      const data = readSheetObjectsCached_();  // ใช้แคช
       const docNos = data
         .filter(r => normalizeText(r[COL_STATUS]).includes('pending'))
         .map(r => r[COL_DOC_NO])
@@ -595,9 +521,8 @@ function doPost(e) {
     }
 
 
-    // ►►► 4) NEW: intent = RegistrationFunction → ลงทะเบียนผู้ใช้จาก LINE userId
+    // ►►► 4) NEW: intent = RegistrationFunction (Regis-Yes) → ลงทะเบียนผู้ใช้จาก LINE userId
     if (displayName === 'Regis-Yes') {
-    //if (displayName === 'RegistrationFunction') {
       const lineUserId = extractLineUserId_(body);
       if (!lineUserId) {
         return ContentService.createTextOutput(JSON.stringify(dialogflowTextResponse_(
@@ -626,7 +551,6 @@ function doPost(e) {
       }
     }
 
-
     // 5) ไม่ตรง intent ใดเลย
     return ContentService.createTextOutput(JSON.stringify(dialogflowTextResponse_(
       'Intent ไม่ถูกต้อง หรือไม่ได้รับอนุญาต'
@@ -646,4 +570,3 @@ function dialogflowTextResponse_(text) {
     fulfillmentMessages: [{ text: { text: [text] } }]
   };
 }
-
