@@ -1,0 +1,519 @@
+/***** CONFIG *****/
+// ควรเก็บ TOKEN ใน Script Properties ชื่อ 'CHANNEL_ACCESS_TOKEN' เพื่อความปลอดภัย
+const CHANNEL_ACCESS_TOKEN =
+  PropertiesService.getScriptProperties().getProperty('CHANNEL_ACCESS_TOKEN')
+
+// ใช้ชุดเดียวกับเดิม (อ่านข้อมูล/LOG/RIS) ผ่าน Script Properties
+const SCRIPT_PROPS   = PropertiesService.getScriptProperties();
+const SPREADSHEET_ID = SCRIPT_PROPS.getProperty('DATA_SHEET_ID');
+const SHEET_NAME     = SCRIPT_PROPS.getProperty('DATA_SHEET_NAME'); // "Master"
+const COL_DOC_NO     = 'เลขที่รับเข้า';
+const COL_KEYWORDS   = 'keyword_for_search';
+const COL_TITLE      = 'หัวข้อชื่อหนังสือ';
+const LOG_SHEET_ID   = SCRIPT_PROPS.getProperty('LOG_SHEET_ID');
+const LOG_SHEET_NAME = SCRIPT_PROPS.getProperty('LOG_SHEET_NAME');
+const RIS_SHEET_ID   = SCRIPT_PROPS.getProperty('RIS_SHEET_ID');
+const RIS_SHEET_NAME = SCRIPT_PROPS.getProperty('RIS_SHEET_NAME');
+
+// Queue จะเก็บในสเปรดชีตเดียวกับ LOG (สร้างชีตชื่อ ASYNC_QUEUE)
+const QUEUE_SHEET_ID   = LOG_SHEET_ID;
+const QUEUE_SHEET_NAME = 'ASYNC_QUEUE';
+
+// LINE endpoints
+const LINE_PUSH_URL = 'https://api.line.me/v2/bot/message/push';
+
+// จำกัดจำนวนงานต่อ 1 รอบ trigger กันเวลานานเกิน
+const MAX_JOBS_PER_RUN = 5;
+
+/***** UTILITIES *****/
+function safeStringify(obj, maxLen = 45000) {
+  try {
+    const cache = new Set();
+    const s = JSON.stringify(obj, function (key, value) {
+      if (typeof value === 'bigint') return value.toString();
+      if (typeof value === 'object' && value !== null) {
+        if (cache.has(value)) return '[Circular]';
+        cache.add(value);
+      }
+      return value;
+    });
+    return s.length > maxLen ? s.slice(0, maxLen) + '…[truncated]' : s;
+  } catch (e) {
+    return `<<Stringify failed: ${e && e.message}>>`;
+  }
+}
+
+function logActivity(message) {
+  try {
+    const logSheet = SpreadsheetApp.openById(LOG_SHEET_ID).getSheetByName(LOG_SHEET_NAME);
+    logSheet.appendRow([new Date(), String(message)]);
+  } catch (e) {
+    console.error(`Failed to write to Audit Log: ${e.message}`);
+    console.log(`Original Log Message: ${message}`);
+  }
+}
+
+function normalizeText(s) {
+  if (!s) return '';
+  return s.toString().trim().toLowerCase();
+}
+
+function extractKeywords(raw) {
+  if (!raw) return [];
+  const splitters = /[,\n\r\t ]+/g;
+  return raw
+    .split(splitters)
+    .map(k => normalizeText(k))
+    .filter(k => k.length >= 4);
+}
+
+function formatCustomDate(tdate) {
+  if (!tdate) return '';
+  var d = (tdate instanceof Date) ? tdate : new Date(tdate);
+  if (isNaN(d)) return '';
+  return Utilities.formatDate(d, "Asia/Bangkok", "dd-MMM-yy HH:mm");
+}
+
+/***** DF Body helpers *****/
+function detectPlatform(body) {
+  if (body && body.queryResult) return 'ES';
+  if (body && (body.fulfillmentInfo || body.sessionInfo)) return 'CX';
+  return 'UNKNOWN';
+}
+
+function parseDialogflowES(body) {
+  const q = (body && body.queryResult) || {};
+  const intentName = (q.intent && q.intent.displayName) || '';
+  const queryText  = q.queryText || '';
+  const parameters = q.parameters || {};
+  const session    = body.session || '';
+  const lineUserId = (((body || {}).originalDetectIntentRequest || {}).payload || {})?.data?.source?.userId || '';
+  return { platform: 'Dialogflow ES', session, intentName, queryText, parameters, lineUserId };
+}
+
+function parseDialogflowCX(body) {
+  const intentName = body?.fulfillmentInfo?.tag || body?.intentInfo?.displayName || '';
+  const session    = body?.sessionInfo?.session || '';
+  const params     = body?.sessionInfo?.parameters || {};
+  const queryText  = body?.text || body?.transcript || '';
+  const lineUserId = body?.payload?.data?.source?.userId || '';
+  return { platform: 'Dialogflow CX', session, intentName, queryText, parameters: params, lineUserId };
+}
+
+function extractLineUserId_(body) {
+  const es = (((body || {}).originalDetectIntentRequest || {}).payload || {})?.data?.source?.userId;
+  if (es) return es;
+  const cx = body?.payload?.data?.source?.userId;
+  if (cx) return cx;
+  return '';
+}
+
+/***** CACHE SHEET *****/
+const CACHE_KEY_SHEET_OBJECTS = 'SHEET_OBJECTS_CACHE_V1';
+
+function readSheetObjectsCached_() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get(CACHE_KEY_SHEET_OBJECTS);
+  if (cached) {
+    try { return JSON.parse(cached); } catch (e) {}
+  }
+  const sh = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
+  const values = sh.getDataRange().getValues();
+  if (values.length <= 1) {
+    cache.put(CACHE_KEY_SHEET_OBJECTS, JSON.stringify([]), 3600);
+    return [];
+  }
+  const headers = values[0].map(h => h.toString().trim());
+  const rows = values.slice(1);
+  const data = rows.map(r => {
+    const obj = {};
+    headers.forEach((h, i) => obj[h] = r[i]);
+    return obj;
+  });
+  cache.put(CACHE_KEY_SHEET_OBJECTS, JSON.stringify(data), 3600);
+  return data;
+}
+
+function clearSheetObjectsCache_() {
+  CacheService.getScriptCache().remove(CACHE_KEY_SHEET_OBJECTS);
+}
+
+/***** SEARCH & PENDING *****/
+const COL_STATUS = 'สถานะ';
+const COL_DATE   = 'วันที่บันทึก';
+
+function searchByKeywords(keywords, matchMode) {
+  const data = readSheetObjectsCached_();
+  const results = [];
+  const wantAll = (matchMode || 'ANY').toUpperCase() === 'ALL';
+
+  data.forEach(row => {
+    const rawKW = row[COL_KEYWORDS];
+    const hay = normalizeText(rawKW);
+    if (!hay) return;
+    if (keywords.length === 0) return;
+
+    const hits = keywords.map(k => hay.indexOf(k) !== -1);
+    const isMatch = wantAll ? hits.every(Boolean) : hits.some(Boolean);
+
+    if (isMatch) {
+      results.push({
+        docNo: row[COL_DOC_NO],
+        title: row[COL_TITLE],
+        matched: keywords.filter((k, idx) => hits[idx])
+      });
+    }
+  });
+
+  const uniq = {};
+  results.forEach(r => {
+    const key = String(r.docNo);
+    if (!uniq[key]) uniq[key] = { title: r.title || '', matched: new Set() };
+    if (!uniq[key].title && r.title) uniq[key].title = r.title;
+    r.matched.forEach(m => uniq[key].matched.add(m));
+  });
+
+  return Object.keys(uniq).map(docNo => ({
+    docNo,
+    title: uniq[docNo].title || '',
+    matchedKeywords: Array.from(uniq[docNo].matched)
+  }));
+}
+
+function buildPendingSummary_() {
+  const data = readSheetObjectsCached_();
+  const pendingRows = data
+    .filter(r => normalizeText(r[COL_STATUS]).includes('pending'))
+    .map(r => {
+      const rawDateStr = (r[COL_DATE] ?? '').toString().trim();
+      const formatted  = rawDateStr ? formatCustomDate(rawDateStr) : '';
+      return {
+        docNo:  r[COL_DOC_NO]  || '',
+        title:  r[COL_TITLE]   || '',
+        dateText: formatted ? `(${formatted})` : ''
+      };
+    });
+
+  const count = pendingRows.length;
+  if (count === 0) return 'ไม่พบบันทึกที่มีสถานะ Pending';
+
+  const lines = [];
+  lines.push(`สถานะ Pending มีทั้งหมด ${count} รายการประกอบด้วย`);
+  pendingRows.slice(0, 50).forEach(r => {
+    const dt = r.dateText ? ` ${r.dateText}` : '';
+    lines.push(`\n${r.docNo} (${r.title}) ${dt}`);
+  });
+  if (pendingRows.length > 50) lines.push(`…และอีก ${pendingRows.length - 50} รายการ`);
+  return lines.join('\n');
+}
+
+/***** RIS Utilities *****/
+function writeRISRegistration_(userId) {
+  const sh = SpreadsheetApp.openById(RIS_SHEET_ID).getSheetByName(RIS_SHEET_NAME);
+  const values = sh.getDataRange().getValues();
+  if (values.length === 0) throw new Error('ชีต RIS ว่าง (ไม่มี header)');
+
+  const headers = values[0].map(h => h.toString().trim());
+  const map = headers.reduce((acc, h, i) => { acc[h] = i; return acc; }, {});
+  if (map['UserID'] === undefined || map['Bol_YN'] === undefined) {
+    throw new Error('ไม่พบคอลัมน์ "UserID" หรือ "Bol_YN" ในชีต RIS');
+  }
+  const row = new Array(headers.length).fill('');
+  row[map['UserID']] = userId;
+  row[map['Bol_YN']] = 'N';
+  sh.appendRow(row);
+}
+
+function getRISBolYN_(userId) {
+  const sh = SpreadsheetApp.openById(RIS_SHEET_ID).getSheetByName(RIS_SHEET_NAME);
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return null;
+
+  const headers = values[0].map(h => h.toString().trim());
+  const map = headers.reduce((acc, h, i) => { acc[h] = i; return acc; }, {});
+  if (map['UserID'] === undefined || map['Bol_YN'] === undefined) {
+    throw new Error('ไม่พบ "UserID" หรือ "Bol_YN"');
+  }
+
+  const colUser = map['UserID'];
+  const colBol  = map['Bol_YN'];
+  const target  = String(userId || '').trim();
+
+  for (let r = 1; r < values.length; r++) {
+    if (String(values[r][colUser]).trim() === target) {
+      const bol = String(values[r][colBol]).trim().toUpperCase();
+      return bol || 'N';
+    }
+  }
+  return null;
+}
+
+/***** LINE Push helpers *****/
+function makeQuickReplyItemsFromLabels_(labels) {
+  const unique = Array.from(new Set((labels || []).map(v => String(v).trim()))).filter(Boolean).slice(0, 13);
+  return unique.map(l => ({
+    type: 'action',
+    action: { type: 'message', label: l, text: `หนังสือ ${l}` }
+  }));
+}
+
+function pushLineText_(userId, text, quickReplyItems) {
+  if (!userId) throw new Error('Missing LINE userId');
+  const body = {
+    to: userId,
+    messages: [{
+      type: 'text',
+      text: String(text || ''),
+      ...(quickReplyItems && quickReplyItems.length ? { quickReply: { items: quickReplyItems } } : {})
+    }]
+  };
+  const res = UrlFetchApp.fetch(LINE_PUSH_URL, {
+    method: 'post',
+    contentType: 'application/json; charset=utf-8',
+    muteHttpExceptions: true,
+    headers: { Authorization: 'Bearer ' + CHANNEL_ACCESS_TOKEN },
+    payload: JSON.stringify(body)
+  });
+  const code = res.getResponseCode();
+  if (code >= 300) logActivity(`LINE push error ${code}: ${res.getContentText()}`);
+}
+
+/***** QUEUE (เก็บในชีต) *****/
+function getQueueSheet_() {
+  const ss = SpreadsheetApp.openById(QUEUE_SHEET_ID);
+  let sh = ss.getSheetByName(QUEUE_SHEET_NAME);
+  if (!sh) {
+    sh = ss.insertSheet(QUEUE_SHEET_NAME);
+    sh.appendRow(['ID','CreatedAt','Status','UserId','Platform','Intent','QueryText','BodyJSON','LastError']);
+  }
+  return sh;
+}
+
+function enqueueJob_(payload) {
+  const body = payload?.originalRequest || {};
+  const plat = detectPlatform(body);
+  const parsed = (plat === 'ES') ? parseDialogflowES(body) :
+                 (plat === 'CX') ? parseDialogflowCX(body) : { intentName:'', queryText:'', lineUserId:'' };
+  const userId = parsed.lineUserId || payload?._meta?.userId || extractLineUserId_(body) || '';
+  const id = Utilities.getUuid();
+  const sh = getQueueSheet_();
+  sh.appendRow([
+    id,
+    new Date(),
+    'PENDING',
+    userId,
+    plat,
+    parsed.intentName,
+    parsed.queryText,
+    safeStringify(body),   // เก็บ "ทั้ง JSON เดิม" ไว้ในแถวนี้
+    ''
+  ]);
+  return id;
+}
+
+function ensureOneOffTrigger_() {
+  const name = 'processAsyncQueue_';
+  const exists = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === name);
+  if (!exists) {
+    // one-off หลัง ~1 นาที (ต่ำสุดที่ทำได้เชิงเสถียร)
+    ScriptApp.newTrigger(name).timeBased().after(60 * 1000).create();
+  }
+}
+
+/***** ตัวประมวลผลหลักของคิว *****/
+function processAsyncQueue_() {
+  const sh = getQueueSheet_();
+  const last = sh.getLastRow();
+  if (last < 2) return;
+
+  const data = sh.getRange(2, 1, last - 2 + 1, sh.getLastColumn()).getValues(); // [ [ID,CreatedAt,Status,...], ... ]
+  let processed = 0;
+
+  for (let i = 0; i < data.length; i++) {
+    if (processed >= MAX_JOBS_PER_RUN) break;
+
+    const row = data[i];
+    const status = row[2];
+    if (status !== 'PENDING') continue;
+
+    const rowIdx = i + 2; // sheet row
+    const id       = row[0];
+    const userId   = String(row[3] || '');
+    const platform = String(row[4] || '');
+    const intent   = String(row[5] || '');
+    const queryTxt = String(row[6] || '');
+    const bodyJSON = String(row[7] || '');
+
+    try {
+      const body = JSON.parse(bodyJSON);
+      const { text, quickReplyItems } = handleJob_(body, { platform, intent, queryTxt, userId });
+      pushLineText_(userId, text, quickReplyItems);
+
+      sh.getRange(rowIdx, 3).setValue('DONE');          // Status
+      sh.getRange(rowIdx, 9).setValue('');              // LastError
+      processed++;
+
+    } catch (err) {
+      sh.getRange(rowIdx, 3).setValue('ERROR');
+      sh.getRange(rowIdx, 9).setValue(String(err && err.message || err));
+      logActivity(`QUEUE ERROR ${id}: ${err && err.stack || err}`);
+    }
+  }
+
+  // ถ้าคงเหลือ PENDING อีก ให้ตั้ง trigger อีกรอบ
+  const stillPending = sh.createTextFinder('\tPENDING\t').matchEntireCell(true).useRegularExpression(false).findAll().length ||
+                       sh.createTextFinder('PENDING').matchEntireCell(true).findAll().length; // เผื่อบางกรณี
+  if (stillPending > 0) ensureOneOffTrigger_();
+}
+
+/***** Core Handler: ทำงานตาม displayName เหมือนเดิม แล้วคืน text + quickReply *****/
+function handleJob_(dfBody, meta) {
+  const plat = detectPlatform(dfBody);
+  const parsed = (plat === 'ES') ? parseDialogflowES(dfBody) :
+                 (plat === 'CX') ? parseDialogflowCX(dfBody) : { intentName:'', queryText:'', parameters:{}, lineUserId: meta?.userId || '' };
+
+  const displayName = parsed.intentName || meta?.intent || '';
+  const userId = parsed.lineUserId || meta?.userId || '';
+  const queryText = parsed.queryText || meta?.queryTxt || '';
+  const params = parsed.parameters || {};
+
+  // ====== Routing ตาม displayName ======
+  if (displayName === 'DisplayText') {
+    return { text: 'แสดงข้อความนี้ไปที่ line', quickReplyItems: [] };
+  }
+
+  if (displayName === 'FindPending') {
+    const text = buildPendingSummary_();
+    const data = readSheetObjectsCached_();
+    const docNos = data
+      .filter(r => normalizeText(r[COL_STATUS]).includes('pending'))
+      .map(r => r[COL_DOC_NO]).filter(Boolean);
+    const qr = makeQuickReplyItemsFromLabels_(docNos);
+    return { text, quickReplyItems: qr };
+  }
+
+  if (displayName === 'Regis-Yes') {
+    const uid = userId;
+    if (!uid) return { text: 'ไม่พบ lineUserId ในคำขอที่ได้รับ โปรดตรวจสอบการเชื่อมต่อ LINE ↔ Dialogflow', quickReplyItems: [] };
+    const bol = getRISBolYN_(uid);
+    if (bol === 'Y') return { text: 'ท่านสมัครสำเร็จแล้ว สามารถใช้งานได้', quickReplyItems: [] };
+    if (bol === 'N') return { text: 'ท่านเคยสมัครแล้ว รอทาง Admin ตรวจสอบและดำเนินการ', quickReplyItems: [] };
+    // ยังไม่อยู่ในระบบ → ลงทะเบียนใหม่ (N)
+    writeRISRegistration_(uid);
+    return { text: `บันทึกผู้ใช้สำเร็จ: ${uid} (Bol_YN = N)`, quickReplyItems: [] };
+  }
+
+  if (displayName === 'AI-Search-custom') {
+    // พยายามเอา docNo จาก parameter / ข้อความ
+    const p = params || {};
+    let docNo = String(p.docNo || '');
+    if (!docNo) {
+      const m = queryText.match(/\b(\d{4})\b/);
+      docNo = m ? m[1] : '';
+    }
+    const text = `${docNo ? docNo + ' ' : ''}Success!!!\nคำถาม: ${String(p.queryText || queryText || '')}`;
+    return { text, quickReplyItems: [] };
+  }
+
+  if (displayName === 'SearchByKeyboard') {
+    // 1) ได้ input จาก parameter หรือ queryText
+    const rawInput =
+      (params.keyword || params.keywords || '').toString() ||
+      queryText || '';
+    const input = rawInput.toString().trim();
+
+    // 2) case "AI token + 4 digits"
+    const hasAIToken = /\bai(?:\s*search)?\b/i.test(input);
+    const fourMatch = input.match(/\b(\d{4})\b/);
+    if (hasAIToken && fourMatch) {
+      const doc4 = fourMatch[1];
+      const data = readSheetObjectsCached_();
+      const matchedRows = data.filter(r => String(r[COL_DOC_NO]).trim() === doc4);
+      if (matchedRows.length === 0) {
+        return { text: `ไม่พบเลขหนังสือ ${doc4} ในฐานข้อมูล`, quickReplyItems: [] };
+      }
+      const lines = matchedRows.map(r =>
+        `โปรดพิมพ์คำถามที่ต้องการถามเกี่ยวกับเอกสาร\nเลขหนังสือ: ${r[COL_DOC_NO] ?? ''}\nชื่อหนังสือ: ${r[COL_TITLE] ?? ''}`
+      );
+      // แนะนำปุ่มให้ user ส่งข้อความกลับไปเข้า intent AI-Search-custom
+      const qr = [{
+        type: 'action',
+        action: { type: 'message', label: 'ถาม AI เล่มนี้', text: `ต้องการสอบถาม AI เลขหนังสือ : ${doc4}` }
+      }];
+      return { text: lines.join('\n\n'), quickReplyItems: qr };
+    }
+
+    // 3) four digits only
+    const isFourDigitsOnly = /^\d{4}$/.test(input);
+    if (isFourDigitsOnly) {
+      const data = readSheetObjectsCached_();
+      const matchedRows = data.filter(r => String(r[COL_DOC_NO]).trim() === input);
+      if (matchedRows.length === 0) {
+        return { text: `ไม่พบเลขที่รับเข้า ${input}`, quickReplyItems: [] };
+      }
+      const lines = [];
+      matchedRows.forEach((r, idx) => {
+        if (matchedRows.length > 1) lines.push(`รายการที่ ${idx + 1}`);
+        lines.push(`\nเลขที่รับเข้า: ${r[COL_DOC_NO] ?? ''}`);
+        lines.push(`\nหัวข้อชื่อหนังสือ: ${r[COL_TITLE] ?? ''}`);
+        lines.push(`\n[AI] title: ${r['title'] ?? ''}`);
+        lines.push(`\n[AI] detail: ${r['detail'] ?? ''}`);
+        lines.push(`\n[AI] summary: ${r['summary'] ?? ''}`);
+        lines.push(`\nสถานะ: ${r['สถานะ'] ?? ''}`);
+        lines.push(`\nหมายเหตุ: ${r['หมายเหตุ'] ?? ''}`);
+        lines.push(`\nURL ไฟล์: ${r['URL ไฟล์'] ?? ''}`);
+        if (idx < matchedRows.length - 1) lines.push('');
+      });
+      const quick = [
+        { type: 'action', action: { type: 'message', label: 'use AI search', text: `ต้องการสอบถาม AI เลขหนังสือ : ${input}` } },
+        { type: 'action', action: { type: 'message', label: 'cancel',       text: '' } }
+      ];
+      return { text: lines.join('\n'), quickReplyItems: quick };
+    }
+
+    // 4) general keywords
+    const matchMode = (params.matchMode || params.matchmode || 'ANY').toString();
+    const keywords = extractKeywords(input);
+    if (keywords.length === 0) {
+      return { text: 'กรุณาพิมพ์คำค้นอย่างน้อยหนึ่งคำ และแต่ละคำต้องยาวตั้งแต่ 4 ตัวอักษรขึ้นไป', quickReplyItems: [] };
+    }
+    const found = searchByKeywords(keywords, matchMode);
+    if (found.length === 0) {
+      return { text: `ไม่พบเลขที่รับเข้าที่มีคำว่า: ${keywords.join(', ')}`, quickReplyItems: [] };
+    }
+    const lines = [];
+    lines.push(`พบในเลขที่รับเข้า ${found.length} รายการ:`);
+    found.slice(0, 50).forEach(r => {
+      const mk = r.matchedKeywords.length ? ` (matched: ${r.matchedKeywords.join(', ')})` : '';
+      const titlePart = r.title ? `: ${r.title}` : '';
+      lines.push(`• ${r.docNo}${titlePart} ${mk}`);
+    });
+    if (found.length > 50) lines.push(`…และอีก ${found.length - 50} รายการ`);
+    const qr = makeQuickReplyItemsFromLabels_(found.map(r => r.docNo));
+    return { text: lines.join('\n'), quickReplyItems: qr };
+  }
+
+  // ไม่ตรง intent ใด
+  return { text: 'Intent ไม่ถูกต้อง หรือไม่ได้รับอนุญาต', quickReplyItems: [] };
+}
+
+/***** Web App entrypoint (รับจากสคริปต์ #1) *****/
+function doPost(e) {
+  try {
+    const payload = JSON.parse(e?.postData?.contents || '{}');
+    // เข้าคิวงาน แล้วตั้ง one-off trigger เพื่อประมวลผล
+    const jobId = enqueueJob_(payload);
+    ensureOneOffTrigger_();
+
+    // ตอบกลับเร็วเพื่อให้สคริปต์ #1 ไม่ต้องรอ
+    return ContentService
+      .createTextOutput(JSON.stringify({ ok: true, jobId }))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (err) {
+    logActivity('WORKER doPost error: ' + (err && err.stack || err));
+    return ContentService
+      .createTextOutput(JSON.stringify({ ok: false, error: String(err && err.message || err) }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
