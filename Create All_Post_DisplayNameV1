@@ -1,0 +1,663 @@
+//สมบูรณืแล้วแต่ดัน return ข้อมูลกลับไป n8n แทนซะงั้น
+/******************** CONFIG ********************/
+const SCRIPT_PROPS   = PropertiesService.getScriptProperties();
+const SPREADSHEET_ID = SCRIPT_PROPS.getProperty('DATA_SHEET_ID');
+const SHEET_NAME     = SCRIPT_PROPS.getProperty('DATA_SHEET_NAME'); // "Master"
+const COL_DOC_NO     = 'เลขที่รับเข้า';
+const COL_KEYWORDS   = 'keyword_for_search';
+const COL_TITLE      = 'หัวข้อชื่อหนังสือ';
+const LOG_SHEET_ID   = SCRIPT_PROPS.getProperty('LOG_SHEET_ID');
+const LOG_SHEET_NAME = SCRIPT_PROPS.getProperty('LOG_SHEET_NAME');
+const RIS_SHEET_ID   = SCRIPT_PROPS.getProperty('RIS_SHEET_ID');
+const RIS_SHEET_NAME = SCRIPT_PROPS.getProperty('RIS_SHEET_NAME');
+
+/******************** UTILITIES: LOG & SAFE JSON ********************/
+function safeStringify(obj, maxLen = 45000) {
+  try {
+    const cache = new Set();
+    const s = JSON.stringify(obj, function (key, value) {
+      if (typeof value === 'bigint') return value.toString();
+      if (typeof value === 'object' && value !== null) {
+        if (cache.has(value)) return '[Circular]';
+        cache.add(value);
+      }
+      return value;
+    });
+    return s.length > maxLen ? s.slice(0, maxLen) + '…[truncated]' : s;
+  } catch (e) {
+    return `<<Stringify failed: ${e && e.message}>>`;
+  }
+}
+
+function logActivity(message) {
+  try {
+    const logSheet = SpreadsheetApp.openById(LOG_SHEET_ID).getSheetByName(LOG_SHEET_NAME);
+    logSheet.appendRow([new Date(), message]);
+  } catch (e) {
+    console.error(`Failed to write to Audit Log: ${e.message}`);
+    console.log(`Original Log Message: ${message}`);
+  }
+}
+
+function writeStructuredLog({platform, session, intentName, queryText, parameters, lineUserId, headers, raw}) {
+  try {
+    const sheet = SpreadsheetApp.openById(LOG_SHEET_ID).getSheetByName(LOG_SHEET_NAME);
+    const now = new Date();
+    const row = [
+      now,
+      platform,
+      session,
+      intentName,
+      queryText,
+      safeStringify(parameters),
+      lineUserId,
+      safeStringify(headers),
+      safeStringify(raw)
+    ];
+    sheet.appendRow(row);
+  } catch (e) {
+    logActivity('writeStructuredLog error: ' + e);
+  }
+}
+
+/******************** DIALOGFLOW HELPERS ********************/
+function dialogflowTextResponse_(text) {
+  return {
+    fulfillmentText: text,
+    fulfillmentMessages: [{ text: { text: [text] } }]
+  };
+}
+
+function dialogflowLineQuickReplyResponse_(text, labels) {
+  const unique = Array.from(new Set((labels || []).map(v => String(v).trim())))
+    .filter(Boolean)
+    .slice(0, 13);
+  const items = unique.map(l => ({
+    type: 'action',
+    action: { type: 'message', label: l, text: `หนังสือ ${l}` }
+  }));
+  return {
+    fulfillmentText: '',
+    fulfillmentMessages: [
+      { payload: { line: { type: 'text', text: String(text || ''), quickReply: { items } } } }
+    ]
+  };
+}
+
+function dialogflowLineQuickReplyCustom_(text, pairs) {
+  const items = (pairs || [])
+    .filter(p => p && p.label && p.text)
+    .slice(0, 13)
+    .map(p => ({
+      type: 'action',
+      action: { type: 'message', label: String(p.label).trim(), text: String(p.text).trim() }
+    }));
+  return {
+    fulfillmentText: '',
+    fulfillmentMessages: [
+      { payload: { line: { type: 'text', text: String(text || ''), quickReply: { items } } } }
+    ]
+  };
+}
+
+/******************** INTENT / PLATFORM HELPERS ********************/
+function getIntentDisplayName(body) {
+  try {
+    if (body?.queryResult?.intent) return body.queryResult.intent.displayName || null; // ES
+    if (body?.intentInfo) return body.intentInfo.displayName || null;                  // CX
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function getUserIdFromRequest(body) {
+  try {
+    // ES
+    const es = (((body || {}).originalDetectIntentRequest || {}).payload || {}).data?.source?.userId;
+    if (es) return es;
+    // CX
+    const cx = body?.payload?.data?.source?.userId;
+    if (cx) return cx;
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function getContextParams_(body, ctxShortName) {
+  const q = (body && body.queryResult) || {};
+  const arr = q.outputContexts || [];
+  const suffix = `/contexts/${ctxShortName}`;
+  for (const c of arr) {
+    if (c && typeof c.name === 'string' && c.name.endsWith(suffix)) {
+      return c.parameters || {};
+    }
+  }
+  return {};
+}
+
+/******************** TEXT NORMALIZATION & SEARCH ********************/
+function normalizeText(s) {
+  if (!s) return '';
+  return s.toString().trim().toLowerCase();
+}
+
+function extractKeywords(raw) {
+  if (!raw) return [];
+  const splitters = /[,\n\r\t ]+/g;
+  return raw
+    .split(splitters)
+    .map(k => normalizeText(k))
+    .filter(k => k.length >= 4);
+}
+
+/******************** CACHE READ SHEET ********************/
+const CACHE_KEY_SHEET_OBJECTS = 'SHEET_OBJECTS_CACHE_V1';
+
+function readSheetObjectsCached_() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get(CACHE_KEY_SHEET_OBJECTS);
+  if (cached) {
+    try { return JSON.parse(cached); } catch (_) {}
+  }
+  const sh = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(SHEET_NAME);
+  const values = sh.getDataRange().getValues();
+  if (values.length <= 1) {
+    cache.put(CACHE_KEY_SHEET_OBJECTS, JSON.stringify([]), 3600);
+    return [];
+  }
+  const headers = values[0].map(h => h.toString().trim());
+  const rows = values.slice(1);
+  const data = rows.map(r => {
+    const obj = {};
+    headers.forEach((h, i) => obj[h] = r[i]);
+    return obj;
+  });
+  cache.put(CACHE_KEY_SHEET_OBJECTS, JSON.stringify(data), 3600);
+  return data;
+}
+
+function clearSheetObjectsCache_() {
+  CacheService.getScriptCache().remove(CACHE_KEY_SHEET_OBJECTS);
+}
+
+function onEdit(e) {
+  clearSheetObjectsCache_();
+}
+
+/******************** SEARCH CORE ********************/
+function searchByKeywords(keywords, matchMode) {
+  const data = readSheetObjectsCached_();
+  const results = [];
+  const wantAll = (matchMode || 'ANY').toUpperCase() === 'ALL';
+
+  data.forEach(row => {
+    const rawKW = row[COL_KEYWORDS];
+    const hay = normalizeText(rawKW);
+    if (!hay) return;
+    if (keywords.length === 0) return;
+
+    const hits = keywords.map(k => hay.indexOf(k) !== -1);
+    const isMatch = wantAll ? hits.every(Boolean) : hits.some(Boolean);
+
+    if (isMatch) {
+      results.push({
+        docNo: row[COL_DOC_NO],
+        title: row[COL_TITLE],
+        matched: keywords.filter((k, idx) => hits[idx])
+      });
+    }
+  });
+
+  const uniq = {};
+  results.forEach(r => {
+    const key = String(r.docNo);
+    if (!uniq[key]) {
+      uniq[key] = { title: r.title || '', matched: new Set() };
+    }
+    if (!uniq[key].title && r.title) uniq[key].title = r.title;
+    r.matched.forEach(m => uniq[key].matched.add(m));
+  });
+
+  return Object.keys(uniq).map(docNo => ({
+    docNo,
+    title: uniq[docNo].title || '',
+    matchedKeywords: Array.from(uniq[docNo].matched)
+  }));
+}
+
+/******************** PENDING SUMMARY ********************/
+const COL_STATUS = 'สถานะ';
+const COL_DATE   = 'วันที่บันทึก';
+
+function buildPendingSummary_() {
+  const data = readSheetObjectsCached_();
+  const pendingRows = data
+    .filter(r => normalizeText(r[COL_STATUS]).includes('pending'))
+    .map(r => {
+      const rawDateStr = (r[COL_DATE] ?? '').toString().trim();
+      const formatted  = rawDateStr ? formatCustomDate(rawDateStr) : '';
+      return {
+        docNo:  r[COL_DOC_NO]  || '',
+        title:  r[COL_TITLE]   || '',
+        dateText: formatted ? `(${formatted})` : ''
+      };
+    });
+
+  const count = pendingRows.length;
+  if (count === 0) return 'ไม่พบบันทึกที่มีสถานะ Pending';
+
+  const lines = [];
+  lines.push(`สถานะ Pending มีทั้งหมด ${count} รายการประกอบด้วย`);
+  pendingRows.slice(0, 50).forEach(r => {
+    const dt = r.dateText ? ` ${r.dateText}` : '';
+    lines.push(`\n${r.docNo} (${r.title}) ${dt}`);
+  });
+  if (pendingRows.length > 50) {
+    lines.push(`…และอีก ${pendingRows.length - 50} รายการ`);
+  }
+  return lines.join('\n');
+}
+
+function formatCustomDate(tdate) {
+  if (!tdate) return '';
+  var d = (tdate instanceof Date) ? tdate : new Date(tdate);
+  if (isNaN(d)) return '';
+  return Utilities.formatDate(d, "Asia/Bangkok", "dd-MMM-yy HH:mm");
+}
+
+/******************** RIS REGISTER / AUTH ********************/
+function writeRISRegistration_(userId) {
+  if (!RIS_SHEET_ID || !RIS_SHEET_NAME) {
+    throw new Error('RIS_SHEET_ID หรือ RIS_SHEET_NAME ไม่ถูกตั้งค่าใน Script Properties');
+  }
+  const sh = SpreadsheetApp.openById(RIS_SHEET_ID).getSheetByName(RIS_SHEET_NAME);
+  if (!sh) throw new Error('ไม่พบชีต RIS_SHEET_NAME ในสเปรดชีตที่ระบุ');
+
+  const rng = sh.getDataRange();
+  const values = rng.getValues();
+  if (values.length === 0) throw new Error('ชีต RIS ว่างเปล่า (ไม่มีส่วนหัวคอลัมน์)');
+
+  const headers = values[0].map(h => h.toString().trim());
+  const map = headers.reduce((acc, h, i) => { acc[h] = i; return acc; }, {});
+  if (map['UserID'] === undefined || map['Bol_YN'] === undefined) {
+    throw new Error('ไม่พบคอลัมน์ "UserID" หรือ "Bol_YN" ในชีต RIS');
+  }
+
+  const row = new Array(headers.length).fill('');
+  row[map['UserID']] = userId;
+  row[map['Bol_YN']] = 'N';
+  sh.appendRow(row);
+}
+
+function hasUserInRIS_(userId) {
+  if (!RIS_SHEET_ID || !RIS_SHEET_NAME) {
+    throw new Error('RIS_SHEET_ID หรือ RIS_SHEET_NAME ไม่ถูกตั้งค่าใน Script Properties');
+  }
+  const sh = SpreadsheetApp.openById(RIS_SHEET_ID).getSheetByName(RIS_SHEET_NAME);
+  if (!sh) throw new Error('ไม่พบชีต RIS_SHEET_NAME ในสเปรดชีตที่ระบุ');
+
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return false;
+
+  const headers = values[0].map(h => h.toString().trim());
+  const map = headers.reduce((acc, h, i) => { acc[h] = i; return acc; }, {});
+  if (map['UserID'] === undefined) {
+    throw new Error('ไม่พบคอลัมน์ "UserID" ในชีต RIS');
+  }
+
+  const col = map['UserID'];
+  for (let r = 1; r < values.length; r++) {
+    if (String(values[r][col]).trim() === String(userId).trim()) return true;
+  }
+  return false;
+}
+
+function getRISBolYN_(userId) {
+  if (!RIS_SHEET_ID || !RIS_SHEET_NAME) {
+    throw new Error('RIS_SHEET_ID หรือ RIS_SHEET_NAME ไม่ถูกตั้งค่าใน Script Properties');
+  }
+  const sh = SpreadsheetApp.openById(RIS_SHEET_ID).getSheetByName(RIS_SHEET_NAME);
+  if (!sh) throw new Error('ไม่พบชีต RIS_SHEET_NAME ในสเปรดชีตที่ระบุ');
+
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return null;
+
+  const headers = values[0].map(h => h.toString().trim());
+  const map = headers.reduce((acc, h, i) => { acc[h] = i; return acc; }, {});
+  if (map['UserID'] === undefined || map['Bol_YN'] === undefined) {
+    throw new Error('ไม่พบคอลัมน์ "UserID" หรือ "Bol_YN" ในชีต RIS');
+  }
+
+  const colUser = map['UserID'];
+  const colBol  = map['Bol_YN'];
+  const target  = String(userId || '').trim();
+
+  for (let r = 1; r < values.length; r++) {
+    if (String(values[r][colUser]).trim() === target) {
+      const bol = String(values[r][colBol]).trim().toUpperCase();
+      return bol || 'N';
+    }
+  }
+  return null;
+}
+
+function isAuthorized_(body) {
+  const lineUserId = getUserIdFromRequest(body);
+  if (!lineUserId) return false;
+  const bol = getRISBolYN_(lineUserId);
+  return bol === 'Y';
+}
+
+function denyAccessResponse_() {
+  return ContentService.createTextOutput(JSON.stringify(
+    dialogflowTextResponse_('ท่านไม่มีสิทธิ์ในการใช้บริการ Chatbot นี้ กรุณาติดต่อ Admin')
+  )).setMimeType(ContentService.MimeType.JSON);
+}
+
+/******************** LINE PUSH ********************/
+function getChannelAccessToken_() {
+  return PropertiesService.getScriptProperties().getProperty('CHANNEL_ACCESS_TOKEN');
+}
+
+function sendPushMessage(userId, message) {
+  var token = getChannelAccessToken_();
+  if (!token) {
+    throw new Error('CHANNEL_ACCESS_TOKEN is not set in Script Properties');
+  }
+  var url = 'https://api.line.me/v2/bot/message/push';
+  var msgObject = (typeof message === 'string') ? { type: 'text', text: message } : message;
+  var payload = { to: userId, messages: [msgObject] };
+  var options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + token },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+  var response = UrlFetchApp.fetch(url, options);
+  var code = response.getResponseCode();
+  var text = response.getContentText();
+  Logger.log('LINE API Response: ' + code + ' ' + text);
+  if (code < 200 || code >= 300) throw new Error('LINE push failed: ' + code + ' ' + text);
+  return { statusCode: code, body: text };
+}
+
+/******************** WEBHOOK ENTRY ********************/
+function doPost(e) {
+  try {
+    if (!e || !e.postData || !e.postData.contents) {
+      return jsonOut({ status: 'error', message: 'Empty request body' }, 400);
+    }
+
+    var body = JSON.parse(e.postData.contents);
+    var userId = getUserIdFromRequest(body);
+    var displayName = getIntentDisplayName(body);
+
+    // Structured log
+    writeStructuredLog({
+      platform: body?.queryResult ? 'Dialogflow ES' : (body?.sessionInfo ? 'Dialogflow CX' : 'UNKNOWN'),
+      session: body?.session || body?.sessionInfo?.session || '',
+      intentName: displayName || '',
+      queryText: body?.queryResult?.queryText || body?.text || body?.transcript || '',
+      parameters: (body?.queryResult?.parameters) || (body?.sessionInfo?.parameters) || {},
+      lineUserId: userId || '',
+      headers: e?.headers || {},
+      raw: body
+    });
+
+    if (!userId) {
+      return jsonOut({ status: 'error', message: 'LINE userId not found in request body' }, 400);
+    }
+
+    // AUTH gate (ยกเว้น Regis-Yes)
+    if (displayName !== 'Regis-Yes') {
+      try {
+        if (!isAuthorized_(body)) return denyAccessResponse_();
+      } catch (authErr) {
+        logActivity('AUTH ERROR: ' + authErr);
+        return denyAccessResponse_();
+      }
+    }
+
+    /*********** INTENT ROUTING ***********/
+    // 1) SearchByKeyboard — ใช้ logic ของ Code A เท่านั้น (ไม่มีการ push "Success")
+    if (displayName === 'SearchByKeyboard') {
+      const params = (body.queryResult && body.queryResult.parameters) || {};
+      let rawInput =
+        (params.keyword || params.keywords || '').toString() ||
+        (body.queryResult && body.queryResult.queryText) ||
+        (body.text && body.text) || '';
+      const input = rawInput.toString().trim();
+
+      // ถ้า context ai-search-followup ยัง active → โยน event ไป AI-Search-custom
+      const aiCtxParams = getContextParams_(body, 'ai-search-followup');
+      if (Object.keys(aiCtxParams).length > 0) {
+        const eventParams = {
+          docNo: String(aiCtxParams.docNo || ''),
+          title: String(aiCtxParams.title || ''),
+          summary: String(aiCtxParams.summary || ''),
+          fileUrl: String(aiCtxParams.fileUrl || ''),
+          firstIntentDisplayName: String(aiCtxParams.firstIntentDisplayName || 'SearchByKeyboard'),
+          capturedAt: aiCtxParams.capturedAt || new Date().toISOString(),
+          userQuestion: String(input || '')
+        };
+        const respJump = {
+          followupEventInput: {
+            name: 'TRIGGER_AI_SEARCH_CUSTOM',
+            languageCode: 'th',
+            parameters: eventParams
+          }
+        };
+        return ContentService.createTextOutput(JSON.stringify(respJump))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+
+      // ตรวจ token AI + เลข 4 หลัก
+      const hasAIToken = /\bai(?:\s*search)?\b/i.test(input);
+      const fourMatch = input.match(/\b(\d{4})\b/);
+      if (hasAIToken && fourMatch) {
+        const doc4 = fourMatch[1];
+        const data = readSheetObjectsCached_();
+        const matchedRows = data.filter(r => String(r[COL_DOC_NO]).trim() === doc4);
+
+        if (matchedRows.length === 0) {
+          return ContentService.createTextOutput(JSON.stringify(
+            dialogflowTextResponse_(`ไม่พบเลขหนังสือ ${doc4} ในฐานข้อมูล`)
+          )).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        const lines = matchedRows.map(r =>
+          `โปรดใช้คำถามที่ต้องการถาม (เลขหนังสือ) : ${r[COL_DOC_NO] ?? ''} , ชื่อหนังสือ : ${r[COL_TITLE] ?? ''}`
+        );
+
+        const session = (body && body.session) || '';
+        const followCtxName = `${session}/contexts/ai-search-followup`;
+        const first = matchedRows[0] || {};
+        const payload = {
+          firstIntentDisplayName: displayName || 'SearchByKeyboard',
+          docNo: String(first[COL_DOC_NO] ?? doc4),
+          title: String(first[COL_TITLE] ?? ''),
+          summary: String(first['summary'] ?? ''),
+          detail: String(first['detail'] ?? ''),
+          fileUrl: String(first['URL ไฟล์'] ?? ''),
+          capturedAt: new Date().toISOString()
+        };
+
+        const resp = {
+          fulfillmentText: lines.join('\n'),
+          outputContexts: [{ name: followCtxName, lifespanCount: 2, parameters: payload }]
+        };
+        return ContentService.createTextOutput(JSON.stringify(resp))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+
+      // ตัวเลข 4 หลักล้วน
+      const isFourDigitsOnly = /^\d{4}$/.test(input);
+      if (isFourDigitsOnly) {
+        const data = readSheetObjectsCached_();
+        const matchedRows = data.filter(r => String(r[COL_DOC_NO]).trim() === input);
+        if (matchedRows.length === 0) {
+          return ContentService.createTextOutput(JSON.stringify(
+            dialogflowTextResponse_(`ไม่พบเลขที่รับเข้า ${input}`)
+          )).setMimeType(ContentService.MimeType.JSON);
+        }
+
+        const lines = [];
+        matchedRows.forEach((r, idx) => {
+          if (matchedRows.length > 1) lines.push(`รายการที่ ${idx + 1}`);
+          lines.push(`\nเลขที่รับเข้า: ${r[COL_DOC_NO] ?? ''}`);
+          lines.push(`\nหัวข้อชื่อหนังสือ: ${r[COL_TITLE] ?? ''}`);
+          lines.push(`\n[AI] title: ${r['title'] ?? ''}`);
+          lines.push(`\n[AI] detail: ${r['detail'] ?? ''}`);
+          lines.push(`\n[AI] summary: ${r['summary'] ?? ''}`);
+          lines.push(`\nสถานะ: ${r['สถานะ'] ?? ''}`);
+          lines.push(`\nหมายเหตุ: ${r['หมายเหตุ'] ?? ''}`);
+          lines.push(`\nURL ไฟล์: ${r['URL ไฟล์'] ?? ''}`);
+          if (idx < matchedRows.length - 1) lines.push('');
+        });
+
+        const qr = dialogflowLineQuickReplyCustom_(
+          lines.join('\n'),
+          [
+            { label: 'use AI search', text: `ต้องการสอบถาม AI เลขหนังสือ : ${input}` },
+            { label: 'cancel',        text: '' }
+          ]
+        );
+
+        return ContentService.createTextOutput(JSON.stringify(qr))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+
+      // ค้นคำทั่วไป
+      const matchMode = (params.matchMode || params.matchmode || 'ANY').toString();
+      const keywords = extractKeywords(input);
+      if (keywords.length === 0) {
+        return ContentService.createTextOutput(JSON.stringify(dialogflowTextResponse_(
+          'กรุณาพิมพ์คำค้นอย่างน้อยหนึ่งคำ และแต่ละคำต้องยาวตั้งแต่ 4 ตัวอักษรขึ้นไป'
+        ))).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      const found = searchByKeywords(keywords, matchMode);
+      if (found.length === 0) {
+        return ContentService.createTextOutput(JSON.stringify(dialogflowTextResponse_(
+          `ไม่พบเลขที่รับเข้าที่มีคำว่า: ${keywords.join(', ')}`
+        ))).setMimeType(ContentService.MimeType.JSON);
+      }
+
+      const lines2 = [];
+      lines2.push(`พบในเลขที่รับเข้า ${found.length} รายการ:`);
+      found.slice(0, 50).forEach(r => {
+        const mk = r.matchedKeywords.length ? ` (matched: ${r.matchedKeywords.join(', ')})` : '';
+        const titlePart = r.title ? `: ${r.title}` : '';
+        lines2.push(`• ${r.docNo}${titlePart} ${mk}`);
+      });
+      if (found.length > 50) lines2.push(`…และอีก ${found.length - 50} รายการ`);
+
+      const quickDocNos = found.map(r => r.docNo).filter(Boolean);
+      const responsePayload = dialogflowLineQuickReplyResponse_(lines2.join('\n'), quickDocNos);
+      return ContentService.createTextOutput(JSON.stringify(responsePayload))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // 2) DisplayText
+    if (displayName === 'DisplayText') {
+      // จะ push หรือไม่ push ก็ได้ — คงเดิมไว้เป็นตัวอย่าง
+      try { sendPushMessage(userId, 'แสดงข้อความนี้ไปที่ line'); } catch (pErr) { logActivity('Push error: ' + pErr); }
+      return ContentService.createTextOutput(JSON.stringify(
+        dialogflowTextResponse_('แสดงข้อความนี้ไปที่ line')
+      )).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // 3) FindPending
+    if (displayName === 'FindPending') {
+      const text = buildPendingSummary_();
+      const data = readSheetObjectsCached_();
+      const docNos = data
+        .filter(r => normalizeText(r[COL_STATUS]).includes('pending'))
+        .map(r => r[COL_DOC_NO])
+        .filter(Boolean);
+
+      try { sendPushMessage(userId, 'สรุป Pending ถูกส่งให้แล้ว'); } catch (pErr) { logActivity('Push error: ' + pErr); }
+
+      const responsePayload = dialogflowLineQuickReplyResponse_(text, docNos);
+      return ContentService.createTextOutput(JSON.stringify(responsePayload))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // 4) Regis-Yes (ลงทะเบียน)
+    if (displayName === 'Regis-Yes') {
+      const lineUserId = userId;
+      if (!lineUserId) {
+        return ContentService.createTextOutput(JSON.stringify(dialogflowTextResponse_(
+          'ไม่พบ lineUserId ในคำขอที่ได้รับ โปรดตรวจสอบการเชื่อมต่อ LINE ↔ Dialogflow'
+        ))).setMimeType(ContentService.MimeType.JSON);
+      }
+      try {
+        const bol = getRISBolYN_(lineUserId);
+        if (bol === 'Y') {
+          try { sendPushMessage(lineUserId, 'ท่านสมัครสำเร็จแล้ว สามารถใช้งานได้'); } catch (_) {}
+          return ContentService.createTextOutput(JSON.stringify(dialogflowTextResponse_(
+            'ท่านสมัครสำเร็จแล้ว สามารถใช้งานได้'
+          ))).setMimeType(ContentService.MimeType.JSON);
+        }
+        if (bol === 'N') {
+          try { sendPushMessage(lineUserId, 'ท่านเคยสมัครแล้ว รอทาง Admin ตรวจสอบและดำเนินการ'); } catch (_) {}
+          return ContentService.createTextOutput(JSON.stringify(dialogflowTextResponse_(
+            'ท่านเคยสมัครแล้ว รอทาง Admin ตรวจสอบและดำเนินการ'
+          ))).setMimeType(ContentService.MimeType.JSON);
+        }
+        writeRISRegistration_(lineUserId);
+        try { sendPushMessage(lineUserId, `บันทึกผู้ใช้สำเร็จ: ${lineUserId} (Bol_YN = N)`); } catch (_) {}
+        return ContentService.createTextOutput(JSON.stringify(dialogflowTextResponse_(
+          `บันทึกผู้ใช้สำเร็จ: ${lineUserId} (Bol_YN = N)`
+        ))).setMimeType(ContentService.MimeType.JSON);
+      } catch (errReg) {
+        logActivity('REGISTRATION ERROR: ' + errReg);
+        return ContentService.createTextOutput(JSON.stringify(dialogflowTextResponse_(
+          'บันทึกไม่สำเร็จ: ' + errReg
+        ))).setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+
+    // 5) AI-Search-custom
+    if (displayName === 'AI-Search-custom') {
+      const p = (body.queryResult && body.queryResult.parameters) || {};
+      const docNo = String(p.docNo || '');
+      const queryText1 = String(p.queryText || '');
+      const msg = `${docNo} Success!!!\nคำถาม: ${queryText1}`;
+
+      try { sendPushMessage(userId, msg); } catch (pErr) { logActivity('Push error: ' + pErr); }
+
+      const session = body.session || '';
+      const keepCtx = {
+        name: `${session}/contexts/ai-search-followup`,
+        lifespanCount: 1,
+        parameters: p
+      };
+      return ContentService.createTextOutput(JSON.stringify({
+        fulfillmentText: msg,
+        outputContexts: [keepCtx]
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // ไม่ตรง intent ใด ๆ
+    return ContentService.createTextOutput(JSON.stringify(
+      dialogflowTextResponse_('Intent ไม่ถูกต้อง หรือไม่ได้รับอนุญาต')
+    )).setMimeType(ContentService.MimeType.JSON);
+
+  } catch (err) {
+    return jsonOut({ status: 'error', message: err && err.toString ? err.toString() : String(err) }, 500);
+  }
+}
+
+/******************** JSON OUT ********************/
+function jsonOut(obj, statusCode) {
+  var output = ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+  if (statusCode && output.setStatusCode) {
+    try { output.setStatusCode(statusCode); } catch (e) {}
+  }
+  return output;
+}
