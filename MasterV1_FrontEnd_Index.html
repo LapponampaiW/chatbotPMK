@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <!-- นำเข้า CSS จากไฟล์ Stylesheet.html -->
+  <?!= HtmlService.createHtmlOutputFromFile('Stylesheet').getContent(); ?>
+</head>
+<body>
+  <div class="container">
+    <h1>ฟอร์มบันทึกข้อมูลและแนบเอกสาร</h1>
+    <form id="dataForm">
+      <div class="form-group">
+        <label for="title">หัวข้อชื่อหนังสือ <span class="mandatory">*</span></label>
+        <input type="text" id="title" name="title" required>
+      </div>
+      
+      <div class="form-group">
+        <label for="notes">หมายเหตุ <span class="mandatory">*</span></label>
+        <textarea id="notes" name="notes" rows="4" required></textarea>
+      </div>
+
+      <div class="form-group">
+        <label for="username">Username <span class="mandatory">*</span></label>
+        <select id="username" name="username" required>
+          <option value="">-- กรุณาเลือก --</option>
+          <option value="กานติมา">กานติมา</option>
+          <option value="ปานรดา">ปานรดา</option>
+          <option value="วีระโชติ">วีระโชติ</option>
+          <option value="อโณทัย">อโณทัย</option>
+          <option value="บุคคลทดสอบ">บุคคลทดสอบ</option>
+        </select>
+      </div>
+
+      <!-- ส่วนสำหรับอัปโหลดไฟล์ -->
+      <div class="form-group">
+        <label for="fileUpload">แนบไฟล์ (ถ้ามี)</label>
+        <input type="file" id="fileUpload" name="fileUpload">
+      </div>
+
+      <!-- *** เพิ่มเติม: UI สำหรับเปลี่ยนชื่อไฟล์ *** -->
+      <div class="form-group">
+        <label for="renameFile">ปรับปรุงชื่อไฟล์ (rename) <span class="mandatory">*</span></label>
+        <input type="text" id="renameFile" name="renameFile" placeholder="เลือกไฟล์ก่อนเพื่อกำหนดชื่อ" disabled required>
+      </div>
+
+      <div class="button-group">
+        <button type="submit" id="submitBtn">ส่งข้อมูล</button>
+        <button type="button" id="clearBtn">ล้างข้อมูล</button>
+      </div>
+    </form>
+    <div id="statusMessage"></div>
+  </div>
+
+  <script>
+    const dataForm = document.getElementById('dataForm');
+    const submitBtn = document.getElementById('submitBtn');
+    const clearBtn = document.getElementById('clearBtn');
+    const statusMsg = document.getElementById('statusMessage');
+    const fileInput = document.getElementById('fileUpload');
+    const renameInput = document.getElementById('renameFile'); // *** เพิ่มเติม: ดึง element ใหม่
+
+    // *** เพิ่มเติม: Event Listener เมื่อมีการเลือกไฟล์ ***
+    fileInput.addEventListener('change', function() {
+      const file = this.files[0];
+      if (file) {
+        // ถ้ามีไฟล์, เปิดใช้งานช่อง rename และใส่ชื่อไฟล์เดิม (ไม่รวมนามสกุล) ให้
+        renameInput.disabled = false;
+        const fileName = file.name;
+        const lastDot = fileName.lastIndexOf('.');
+        const nameWithoutExt = (lastDot === -1) ? fileName : fileName.substring(0, lastDot);
+        renameInput.value = nameWithoutExt;
+        renameInput.required = true; // ทำให้เป็นฟิลด์บังคับเมื่อมีไฟล์
+      } else {
+        // ถ้าไม่มีไฟล์, ปิดการใช้งานและล้างค่า
+        renameInput.disabled = true;
+        renameInput.value = '';
+        renameInput.required = false; // ไม่บังคับกรอกเมื่อไม่มีไฟล์
+      }
+    });
+
+    // Event Listener หลักเมื่อกดปุ่ม Submit
+    dataForm.addEventListener('submit', handleFormSubmit);
+    
+    // Event Listener สำหรับปุ่มล้างข้อมูล
+    clearBtn.addEventListener('click', () => {
+      dataForm.reset();
+      statusMsg.innerHTML = '';
+      statusMsg.className = '';
+      // *** เพิ่มเติม: รีเซ็ตสถานะของช่อง rename
+      renameInput.disabled = true;
+      renameInput.required = false;
+    });
+
+    function handleFormSubmit(e) {
+      e.preventDefault();
+
+      const title = document.getElementById('title').value.trim();
+      const notes = document.getElementById('notes').value.trim();
+      const username = document.getElementById('username').value;
+
+      if (!title || !notes || !username) {
+        alert('กรุณากรอกข้อมูลทุกช่องที่มีเครื่องหมาย *');
+        return;
+      }
+
+      setLoadingState(true, 'กำลังตรวจสอบข้อมูล...');
+
+      const file = fileInput.files[0];
+      const formData = {
+        title: title,
+        notes: notes,
+        username: username
+      };
+
+      if (file) {
+        // *** เพิ่มเติม: ตรรกะการเปลี่ยนชื่อไฟล์ ***
+        const newNameBase = renameInput.value.trim();
+        if (!newNameBase) {
+          alert('กรุณาระบุชื่อไฟล์ที่จะปรับปรุง');
+          setLoadingState(false);
+          return;
+        }
+        
+        // เอานามสกุลจากไฟล์เดิมมาต่อท้ายชื่อใหม่
+        const originalFileName = file.name;
+        const lastDot = originalFileName.lastIndexOf('.');
+        const extension = (lastDot === -1) ? '' : originalFileName.substring(lastDot);
+        const finalFileName = newNameBase + extension;
+
+        setLoadingState(true, 'กำลังอัปโหลดไฟล์...');
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          const fileData = event.target.result.split(',');
+          const fileObject = {
+            fileName: finalFileName, // << ใช้ชื่อไฟล์ใหม่ที่นี่
+            mimeType: file.type,
+            data: fileData[1]
+          };
+          google.script.run
+            .withSuccessHandler(uploadSuccess)
+            .withFailureHandler(onFailure)
+            .doUpload(fileObject);
+        };
+        reader.readAsDataURL(file);
+      } else {
+        saveDataToServer(formData);
+      }
+    }
+
+    function uploadSuccess(response) {
+      if (response.status === 'success') {
+        const formData = {
+          title: document.getElementById('title').value.trim(),
+          notes: document.getElementById('notes').value.trim(),
+          username: document.getElementById('username').value,
+          fileName: response.fileName,
+          fileUrl: response.fileUrl
+        };
+        saveDataToServer(formData);
+      } else {
+        onFailure({ message: response.message });
+      }
+    }
+
+    function saveDataToServer(data) {
+      setLoadingState(true, 'กำลังบันทึกข้อมูล...');
+      google.script.run
+        .withSuccessHandler(onSuccess)
+        .withFailureHandler(onFailure)
+        .saveData(data);
+    }
+
+    function onSuccess(response) {
+      statusMsg.innerHTML = response.message;
+      if (response.status === 'success') {
+        statusMsg.className = 'success';
+        dataForm.reset();
+        // *** เพิ่มเติม: รีเซ็ตสถานะของช่อง rename หลังบันทึกสำเร็จ
+        renameInput.disabled = true;
+        renameInput.required = false;
+      } else {
+        statusMsg.className = 'error';
+      }
+      setLoadingState(false);
+    }
+
+    function onFailure(error) {
+      statusMsg.innerHTML = 'เกิดข้อผิดพลาด: ' + error.message;
+      statusMsg.className = 'error';
+      setLoadingState(false);
+      console.error('Apps Script Failure:', error);
+    }
+
+    function setLoadingState(isLoading, message = 'ส่งข้อมูล') {
+      submitBtn.disabled = isLoading;
+      if (isLoading) {
+        submitBtn.innerText = message;
+      } else {
+        submitBtn.innerText = 'ส่งข้อมูล';
+      }
+    }
+  </script>
+</body>
+</html>
