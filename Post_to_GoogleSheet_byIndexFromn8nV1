@@ -1,0 +1,104 @@
+//ใส่ข้อมูลลงใน Google Sheet ต่อจาก n8n
+/**
+ * ดึงค่าคงที่จาก Script Properties เพื่อให้ง่ายต่อการจัดการ
+ */
+const SCRIPT_PROPS = PropertiesService.getScriptProperties();
+const DATA_SHEET_ID = SCRIPT_PROPS.getProperty('DATA_SHEET_ID');
+const DATA_SHEET_NAME = SCRIPT_PROPS.getProperty('DATA_SHEET_NAME');
+
+function doPost(e) {
+  // ตรวจสอบว่าตั้งค่า Script Properties ครบถ้วนหรือไม่
+  if (!DATA_SHEET_ID || !DATA_SHEET_NAME) {
+    const errorMessage = "กรุณาตั้งค่า 'DATA_SHEET_ID' และ 'DATA_SHEET_NAME' ใน Project Settings > Script Properties ก่อน";
+    Logger.log(errorMessage);
+    return ContentService
+      .createTextOutput(JSON.stringify({ status: "configuration_error", message: errorMessage }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  try {
+    // --- START: ส่วนที่แก้ไข ---
+    // 1. แปลงข้อมูล JSON ที่ได้รับจาก n8n
+    // ข้อมูลที่ได้รับคือ Payload โดยตรง ไม่ได้ถูกห่อด้วย key 'body' อีกชั้น
+    const requestBody = e.postData.contents;
+    const data = JSON.parse(requestBody); 
+
+    // ตรวจสอบว่าข้อมูลที่ได้รับมาเป็น Object ที่มีข้อมูลหรือไม่
+    if (!data || typeof data !== 'object' || Object.keys(data).length === 0) {
+      throw new Error("The incoming request body is not a valid JSON object or is empty.");
+    }
+    // --- END: ส่วนที่แก้ไข ---
+
+    // 2. ดึงข้อมูลที่ต้องการจาก object 'data'
+    const title = data.title;
+    const detail = data.detail; 
+    const summary = data.summary;
+    // **สำคัญ:** แก้ไข key ใน n8n ให้ถูกต้องเป็น "keyword_for_search"
+    const keyword_for_search = data.keyword_for_search; 
+
+    // 3. เชื่อมต่อกับ Google Sheet
+    const spreadsheet = SpreadsheetApp.openById(DATA_SHEET_ID);
+    const sheet = spreadsheet.getSheetByName(DATA_SHEET_NAME);
+    
+    if (!sheet) {
+      throw new Error(`ไม่พบชีตชื่อ '${DATA_SHEET_NAME}' ใน Spreadsheet ID ที่ระบุ`);
+    }
+
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    
+    const colIndex = {};
+    headers.forEach((header, i) => {
+      colIndex[header.trim()] = i;
+    });
+
+    const requiredCols = ["เลขที่รับเข้า", "title", "detail", "summary", "keyword_for_search"];
+    for (const col of requiredCols) {
+        if (colIndex[col] === undefined) {
+            throw new Error(`ไม่พบคอลัมน์ที่จำเป็น: "${col}" ในหัวตารางของชีต`);
+        }
+    }
+
+    // 4. ค้นหาและอัปเดตแถวที่ตรงตามเงื่อนไข
+    const dataRange = sheet.getDataRange();
+    const values = dataRange.getValues();
+    let rowUpdated = false;
+    let updatedRowNumber = -1;
+
+    for (let i = 1; i < values.length; i++) {
+      const row = values[i];
+      const receiptNumber = row[colIndex["เลขที่รับเข้า"]];
+      const currentTitle = row[colIndex["title"]];
+
+      if (receiptNumber && !currentTitle) {
+        const rowToUpdate = i + 1;
+
+        sheet.getRange(rowToUpdate, colIndex["title"] + 1).setValue(title);
+        sheet.getRange(rowToUpdate, colIndex["detail"] + 1).setValue(detail);
+        sheet.getRange(rowToUpdate, colIndex["summary"] + 1).setValue(summary);
+        sheet.getRange(rowToUpdate, colIndex["keyword_for_search"] + 1).setValue(keyword_for_search);
+        
+        rowUpdated = true;
+        updatedRowNumber = rowToUpdate;
+        break; 
+      }
+    }
+
+    // 5. สร้างข้อความตอบกลับไปยัง n8n
+    let response;
+    if (rowUpdated) {
+      response = { status: "success", message: `Row ${updatedRowNumber} was updated successfully in sheet '${DATA_SHEET_NAME}'.` };
+    } else {
+      response = { status: "not_found", message: "No matching row found to update (Condition: 'เลขที่รับเข้า' has value and 'title' is empty)." };
+    }
+    
+    return ContentService
+      .createTextOutput(JSON.stringify(response))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (error) {
+    Logger.log(error.toString());
+    return ContentService
+      .createTextOutput(JSON.stringify({ status: "error", message: error.toString() }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
